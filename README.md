@@ -34,6 +34,12 @@ Weekline sits on your Windows desktop and follows a repeating timetable. Use one
 
 ## Getting started
 
+### Download for Windows
+
+[Download ScheduleWidget.exe for Windows x64](https://github.com/reeesx3/weekline/releases/latest/download/ScheduleWidget.exe). Save it in a writable folder and double-click it. Python is included. On first launch, the widget creates the fictional starter schedule beside the executable.
+
+### Run from source
+
 On Windows, install 64-bit Python 3.12 or later with the Python launcher, then download and extract the repository or clone it. Open PowerShell in the project folder and run:
 
 ```powershell
