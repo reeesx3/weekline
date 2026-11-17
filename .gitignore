@@ -1,0 +1,27 @@
+# Local schedules, settings and their backups
+*.json
+!schedule.example.json
+*.ini
+*.tmp
+*.bak
+*.log
+.env*
+*.pem
+*.key
+
+# Python environments and generated bundles
+.venv/
+.build-venv/
+venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+*.exe
+.ruff_cache/
+.pytest_cache/
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

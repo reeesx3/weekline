@@ -1,0 +1,34 @@
+{
+  "categories": {
+    "Optics": "#78B7FF",
+    "Cartography": "#62D5AF",
+    "Workshop": "#F8B86D"
+  },
+  "weeks": {
+    "a": {
+      "mon": [
+        {"time": "10:17", "title": "Align the prism wheel", "category": "Optics", "duration": 32},
+        {"time": "11:23", "title": "Sketch the glass islands", "category": "Cartography", "duration": 47},
+        {"time": "13:41", "title": "Build a paper sextant", "category": "Workshop", "duration": 53},
+        {"time": "15:07", "title": "Catalogue the reflections", "category": "Optics", "duration": 38}
+      ],
+      "tue": [
+        {"time": "10:43", "title": "Trace the amber coast", "category": "Cartography", "duration": 37},
+        {"time": "14:19", "title": "Fold a field atlas", "category": "Workshop", "duration": 42}
+      ],
+      "wed": [{"time": "12:13", "title": "Test the mirror dial", "category": "Optics", "duration": 34}],
+      "thu": [{"time": "11:49", "title": "Ink the floating piers", "category": "Cartography", "duration": 41}],
+      "fri": [{"time": "14:37", "title": "Assemble a light box", "category": "Workshop", "duration": 46}]
+    },
+    "b": {
+      "mon": [
+        {"time": "09:53", "title": "Map the violet shoals", "category": "Cartography", "duration": 43},
+        {"time": "12:29", "title": "Polish a pocket lens", "category": "Optics", "duration": 36}
+      ],
+      "tue": [{"time": "13:17", "title": "Bind the tide charts", "category": "Workshop", "duration": 52}],
+      "wed": [{"time": "10:31", "title": "Measure the prism arc", "category": "Optics", "duration": 44}],
+      "thu": [{"time": "14:47", "title": "Draw the lantern reef", "category": "Cartography", "duration": 39}],
+      "fri": [{"time": "11:11", "title": "Print the island index", "category": "Workshop", "duration": 48}]
+    }
+  }
+}
