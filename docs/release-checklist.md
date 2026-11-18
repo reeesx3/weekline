@@ -1,0 +1,11 @@
+# Release verification
+
+1. Review the final diff, including `translations.py`, `schedule_diff.py`, README and media. Keep personal JSON/INI files and generated executables out of Git.
+2. Run `python -m pip check`, `python -m compileall -q widget.py translations.py schedule_diff.py test_widget.py`, and `python -m unittest -v` with `QT_QPA_PLATFORM=offscreen`. Remove that environment variable before interactive checks.
+3. Locate the installed executable using the running process, shortcuts and the current user's `ScheduleWidget` startup entry. Close it normally so pending changes are saved. Back up the executable and all local data before replacing anything.
+4. Run `build.bat`. Check that the PyInstaller archive includes `translations`, `schedule_diff`, `schedule.example.json` and `qtbase_ru.qm`.
+5. Copy the executable alone to an empty writable folder. Verify that the bundled example is created, switch languages, quit and restart, and check the saved language. Preview a fictional JSON import, cancel and check that the schedule is unchanged. Import it, restart and verify the saved result.
+6. Use the built executable in a separate English demonstration folder for real screenshots and animation. `--window` makes the widget discoverable by window capture tools. Capture the timeline, Appearance language control, import preview, week switching, event editing and compact view. Keep captions, dates and fictional data in English; inspect every output frame for clipping and private data. Quit the demonstration instance.
+7. Update every used installation with the tested executable, preserving schedules and settings. Start the usual copy, verify both new controls and the user's data, then leave only that instance running.
+8. Commit source and media, push to the configured repository and wait for Windows checks. Publish the tested executable as `ScheduleWidget.exe` in GitHub Releases. A CI artifact does not update `releases/latest/download/ScheduleWidget.exe`.
+9. Download that public URL and compare SHA-256 with the tested binary and all updated installations. Check the published README media. Record the commit, release URL, hashes, backup location and running executable path.

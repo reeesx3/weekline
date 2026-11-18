@@ -6,6 +6,7 @@ Weekline desktop schedule widget. Run with python widget.py.
 from __future__ import annotations
 
 import copy
+import errno
 import json
 import math
 import os
@@ -14,10 +15,11 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from functools import partial
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QEvent, QFileSystemWatcher, QPoint, QRect, QRectF, QSettings, QSize, Qt, QTime, QTimer, QUrl, Signal,
+    QEvent, QFileSystemWatcher, QLibraryInfo, QLocale, QTranslator, QPoint, QRect, QRectF, QSettings, QSize, Qt, QTime, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
     QColor,
@@ -39,6 +41,9 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
     QColorDialog,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QTabBar,
     QFrame,
@@ -47,6 +52,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMenu,
+    QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -57,6 +64,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+from schedule_diff import schedule_changes
+from translations import InterfaceText
 
 
 # ───────────────────────────── пути и константы ─────────────────────────────
@@ -133,7 +144,7 @@ def autostart_enabled() -> bool:
 def set_autostart(on: bool) -> None:
     """Включить / выключить автозапуск. Ошибки реестра пробрасываются как OSError."""
     if not IS_WINDOWS:
-        raise OSError("Автозапуск поддерживается только в Windows")
+        raise OSError("Startup is only supported on Windows")
     with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, AUTOSTART_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
         if on:
             winreg.SetValueEx(key, AUTOSTART_NAME, 0, winreg.REG_SZ, autostart_command())
@@ -165,8 +176,6 @@ def repair_autostart() -> None:
 DAY_KEYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 DAY_SHORT = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
 DAY_FULL = ("Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье")
-MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня",
-          "июля", "августа", "сентября", "октября", "ноября", "декабря")
 
 # В schedule.json день можно указать как "mon", "Пн" или "Понедельник"
 DAY_ALIASES: dict[str, int] = {}
@@ -177,7 +186,7 @@ for _i, _names in enumerate(zip(DAY_KEYS, DAY_SHORT, DAY_FULL)):
 # Двухнедельный режим: ключи недель в schedule.json и названия по умолчанию
 WEEK_KEYS = ("a", "b")
 WEEK_ALIASES = {"a": 0, "а": 0, "1": 0, "b": 1, "б": 1, "2": 1}  # латиница, кириллица, номер
-DEFAULT_WEEK_NAMES = ("Неделя А", "Неделя Б")
+DEFAULT_WEEK_KEYS = ("Week A", "Week B")
 WEEK_NAME_MAX = 16
 
 DEFAULT_CATEGORIES = {"Общее": "#4C8DFF"}
@@ -288,8 +297,8 @@ def build_slots(norm_days: list[list]) -> list[list[Slot]]:
         for it in items:
             try:
                 start = parse_time(it["time"])
-                title = str(it.get("title", "")).strip() or "Без названия"
-                cat = str(it.get("category", "Общее")).strip()
+                title = str(it.get("title", ""))
+                cat = str(it.get("category", "Общее"))
                 dur = int(it["duration"]) if it.get("duration") else 0
             except (KeyError, ValueError, TypeError, AttributeError, OverflowError):
                 continue
@@ -317,15 +326,30 @@ def build_slots(norm_days: list[list]) -> list[list[Slot]]:
 @dataclass
 class ScheduleData:
     days: list[list]             # единое расписание по дням (как в файле), его правит редактор
-    weeks: list[list | None]     # недели А и Б; None — недели нет в файле (нужна миграция)
+    weeks: list[list]            # недели А и Б, включая независимые копии отсутствующих недель
     file_categories: dict        # категории ровно в том виде, как они записаны в файле
     categories: dict[str, str]   # категории файла + встроенные пресеты
+    needs_migration: bool = False
+
+    def sorted_text(self) -> str:
+        for week in (self.days, *self.weeks):
+            for items in week:
+                items.sort(key=slot_sort_key)
+        return dump_schedule({
+            "categories": self.file_categories,
+            "days": dict(zip(DAY_KEYS, self.days)),
+            "weeks": {k: dict(zip(DAY_KEYS, wk)) for k, wk in zip(WEEK_KEYS, self.weeks)},
+        })
+
+
+class InterfaceError(ValueError):
+    """A schedule validation error with a translatable message."""
 
 
 def parse_schedule(text: str) -> ScheduleData:
     raw = json.loads(text)
     if not isinstance(raw, dict):
-        raise ValueError('ожидается объект с разделом "days"')
+        raise InterfaceError("Expected an object with a \"days\" section")
     weeks: list[list | None] = [None, None]
     if isinstance(raw.get("weeks"), dict):
         for key, wk in raw["weeks"].items():
@@ -337,13 +361,15 @@ def parse_schedule(text: str) -> ScheduleData:
     elif weeks[0] is not None or weeks[1] is not None:
         days = copy.deepcopy(weeks[0] if weeks[0] is not None else weeks[1])
     else:
-        raise ValueError('ожидается объект с разделом "days" или "weeks"')
+        raise InterfaceError("Expected an object with a \"days\" or \"weeks\" section")
     file_cats: dict[str, str] = {}
     if isinstance(raw.get("categories"), dict):
         for k, v in raw["categories"].items():
             if QColor(str(v)).isValid():
                 file_cats[str(k)] = str(v)
-    return ScheduleData(days, weeks, file_cats, {**DEFAULT_CATEGORIES, **file_cats})
+    complete_weeks = [wk if wk is not None else copy.deepcopy(days) for wk in weeks]
+    return ScheduleData(days, complete_weeks, file_cats, {**DEFAULT_CATEGORIES, **file_cats},
+                        None in weeks)
 
 
 def same_day_items(a: list, b: list) -> bool:
@@ -362,15 +388,6 @@ def week_parity(anchor: date | None, anchor_week: int, day: date) -> int:
     if anchor is None:
         return anchor_week
     return (anchor_week + (monday_of(day) - monday_of(anchor)).days // 7) % 2
-
-
-def plural(n: int, one: str, few: str, many: str) -> str:
-    n10, n100 = n % 10, n % 100
-    if n10 == 1 and n100 != 11:
-        return one
-    if 2 <= n10 <= 4 and not 12 <= n100 <= 14:
-        return few
-    return many
 
 
 def write_text_atomic(path: Path, text: str) -> None:
@@ -426,16 +443,10 @@ def fmt_time(minute: int) -> str:
     return f"{minute // 60:02d}:{minute % 60:02d}"
 
 
-def human(minutes: int) -> str:
-    h, m = divmod(max(0, minutes), 60)
-    if h and m:
-        return f"{h} ч {m} мин"
-    return f"{h} ч" if h else f"{m} мин"
-
-
 # ───────────────────────────── config.json ──────────────────────────────────
 
-CONFIG_HELP = ('x, y — позиция левого верхнего угла; locked — запрет перетаскивания; '
+CONFIG_HELP = ('language — язык интерфейса ("ru" или "en"); '
+               'x, y — позиция левого верхнего угла; locked — запрет перетаскивания; '
                'window_level — "top" (поверх всех окон) или "desktop" (на рабочем столе); '
                'compact — свернут в мини-плашку; biweekly — двухнедельный режим (недели А и Б); '
                'week_names — названия недель; week_anchor — понедельник (ГГГГ-ММ-ДД) недели '
@@ -462,7 +473,7 @@ class WidgetConfig:
     window_level: str = LEVEL_DESKTOP
     compact: bool = False
     biweekly: bool = True                       # двухнедельный режим (по умолчанию включен)
-    week_names: list = field(default_factory=lambda: list(DEFAULT_WEEK_NAMES))
+    week_names: list = field(default_factory=lambda: ["", ""])
     week_anchor: date | None = None             # понедельник опорной недели
     week_anchor_week: int = 0                   # какая это была неделя: 0 — А, 1 — Б
     font_family: str = ""
@@ -474,9 +485,10 @@ class WidgetConfig:
     dense: bool = False
     show_clock: bool = True
     show_categories: bool = True
+    language: str = "ru"
     extra: dict = field(default_factory=dict, repr=False)  # чужие ключи не теряем при сохранении
 
-    KEYS = ("x", "y", "locked", "window_level", "compact",
+    KEYS = ("language", "x", "y", "locked", "window_level", "compact",
             "biweekly", "week_names", "week_anchor", "week_anchor_week",
             "font_family", "font_offset", "accent", "width", "opacity", "background", "dense", "show_clock", "show_categories")
 
@@ -500,17 +512,18 @@ class WidgetConfig:
             value = as_int(raw.get(key))
             return default if value is None else max(low, min(value, high))
 
-        names = list(DEFAULT_WEEK_NAMES)
+        names = ["", ""]
         if isinstance(raw.get("week_names"), list):
             for i, v in enumerate(raw["week_names"][:2]):
                 if isinstance(v, str) and v.strip():
-                    names[i] = v.strip()[:WEEK_NAME_MAX]
+                    names[i] = v
         try:
             anchor = date.fromisoformat(str(raw["week_anchor"])) if raw.get("week_anchor") else None
         except ValueError:
             anchor = None
 
         return cls(
+            language="en" if raw.get("language") == "en" else "ru",
             font_family=raw["font_family"] if isinstance(raw.get("font_family"), str) else "",
             font_offset=bounded("font_offset", 0, -1, 3),
             accent=QColor(raw["accent"]).name() if isinstance(raw.get("accent"), str)
@@ -768,6 +781,7 @@ class ElidedLabel(QLabel):
         if text == self._full:
             return
         self._full = text
+        self.setAccessibleName(text)
         self._elide()
 
     def resizeEvent(self, e):
@@ -849,7 +863,7 @@ class SlotCard(QWidget):
         self.lbl_cat.setTextFormat(Qt.PlainText)
         self.lbl_cat.setFont(make_font(11.5, QFont.Medium))
         self.lbl_cat.setFixedHeight(18)  # = высота бейджа, чтобы карточка не «прыгала»
-        self.badge = QLabel("СЕЙЧАС")
+        self.badge = QLabel()
         self.badge.setFont(make_font(9.5, QFont.Bold, spacing=0.8))
         self.badge.setAlignment(Qt.AlignCenter)
         self.badge.setFixedHeight(18)
@@ -1026,8 +1040,9 @@ class SlotEditor(QFrame):
     copyRequested = Signal(bool)              # скопировать день в другую неделю (подтверждено?)
     closeRequested = Signal()
 
-    def __init__(self, icon_font: str | None, parent: QWidget | None = None):
+    def __init__(self, icon_font: str | None, ui: InterfaceText, parent: QWidget | None = None):
         super().__init__(parent, objectName="editorCard")
+        self.ui = ui
         self._item: dict | None = None
         self._loading = False
         self._copy_target: str | None = None
@@ -1043,12 +1058,14 @@ class SlotEditor(QFrame):
         self.caption.setObjectName("editorCaption")
         self.caption.setFont(make_font(10.5, QFont.Bold, spacing=0.9))
         self.status = QLabel(objectName="editorStatus")
+        self.status.setTextFormat(Qt.PlainText)
         self.status.setFont(make_font(11, QFont.Medium))
         self.btn_close = QPushButton(objectName="iconBtn")
         self.btn_close.setFixedSize(26, 26)
         self.btn_close.setFocusPolicy(Qt.StrongFocus)
         self.btn_close.setCursor(Qt.PointingHandCursor)
-        self.btn_close.setToolTip("Готово — закрыть редактор (Esc)")
+        self.ui.bind(self.btn_close.setAccessibleName, "Close editor")
+        self.ui.bind(self.btn_close.setToolTip, "Done — close editor (Esc)")
         if icon_font:
             f = QFont(icon_font)
             f.setPixelSize(12)
@@ -1069,36 +1086,41 @@ class SlotEditor(QFrame):
         form.setVerticalSpacing(3)
 
         def cap(text: str) -> QLabel:
-            lbl = QLabel(text, objectName="fieldCap")
+            lbl = QLabel(objectName="fieldCap")
+            self.ui.bind(lbl.setText, text)
             lbl.setFont(make_font(9.5, QFont.Bold, spacing=0.7))
             return lbl
 
         self.ed_time = QTimeEdit(objectName="edField")
+        self.ui.bind(self.ed_time.setAccessibleName, "Start time")
         self.ed_time.setDisplayFormat("HH:mm")
         self.ed_time.setWrapping(True)
         self.ed_time.setAlignment(Qt.AlignCenter)
         self.ed_time.setFixedWidth(68)
-        self.ed_time.setToolTip("Начало слота. Колесо мыши или ↑/↓ меняют часы или минуты под курсором")
+        self.ui.bind(self.ed_time.setToolTip, "Start time. Scroll or press ↑/↓ to change the hours or minutes under the cursor")
         self.ed_time.timeChanged.connect(self._on_time)
 
         self.ed_title = QLineEdit(objectName="edField")
-        self.ed_title.setPlaceholderText("Название задачи")
+        self.ui.bind(self.ed_title.setPlaceholderText, "Task title")
+        self.ui.bind(self.ed_title.setAccessibleName, "Task title")
         self.ed_title.setClearButtonEnabled(False)
         self.ed_title.textEdited.connect(self._on_title)
         self.ed_title.returnPressed.connect(lambda: self.fieldChanged.emit("title", self.ed_title.text(), True))
 
         self.ed_cat = ChevronComboBox(objectName="edField")
+        self.ui.bind(self.ed_cat.setAccessibleName, "Category")
         self.ed_cat.setMaxVisibleItems(12)
         self.ed_cat.currentIndexChanged.connect(self._on_category)
 
         self.ed_dur = QSpinBox(objectName="edField")
         self.ed_dur.setRange(0, 24 * 60)
+        self.ui.bind(self.ed_dur.setAccessibleName, "Duration")
         self.ed_dur.setSingleStep(5)
-        self.ed_dur.setSuffix(" мин")
-        self.ed_dur.setSpecialValueText("до следующего")
+        self.ui.bind(self.ed_dur.setSuffix, " min")
+        self.ui.bind(self.ed_dur.setSpecialValueText, "until next slot")
         self.ed_dur.setAlignment(Qt.AlignCenter)
         self.ed_dur.setFixedWidth(118)
-        self.ed_dur.setToolTip("Длительность в минутах. 0 — слот длится до начала следующего")
+        self.ui.bind(self.ed_dur.setToolTip, "Duration in minutes. Set to 0 to end when the next slot starts")
         self.ed_dur.valueChanged.connect(self._on_duration)
 
         for w in (self.ed_time, self.ed_title, self.ed_cat, self.ed_dur):
@@ -1106,13 +1128,13 @@ class SlotEditor(QFrame):
             w.setFixedHeight(30)
         self.ed_time.setFont(make_font(13.5, QFont.DemiBold))
 
-        form.addWidget(cap("НАЧАЛО"), 0, 0)
-        form.addWidget(cap("НАЗВАНИЕ"), 0, 1)
+        form.addWidget(cap("START"), 0, 0)
+        form.addWidget(cap("TITLE"), 0, 1)
         form.addWidget(self.ed_time, 1, 0)
         form.addWidget(self.ed_title, 1, 1, 1, 2)
         form.setRowMinimumHeight(2, 6)
-        form.addWidget(cap("КАТЕГОРИЯ"), 3, 0, 1, 2)
-        form.addWidget(cap("ДЛИТЕЛЬНОСТЬ"), 3, 2)
+        form.addWidget(cap("CATEGORY"), 3, 0, 1, 2)
+        form.addWidget(cap("DURATION"), 3, 2)
         form.addWidget(self.ed_cat, 4, 0, 1, 2)
         form.addWidget(self.ed_dur, 4, 2)
         form.setColumnStretch(1, 1)
@@ -1122,11 +1144,13 @@ class SlotEditor(QFrame):
         acts = QHBoxLayout()
         acts.setContentsMargins(0, 0, 4, 0)
         acts.setSpacing(8)
-        self.btn_delete = QPushButton("Удалить", objectName="edDanger")
-        self.btn_delete.setToolTip("Удалить выбранный слот (нажмите дважды для подтверждения)")
+        self.btn_delete = QPushButton(objectName="edDanger")
+        self.ui.bind(self.btn_delete.setText, "Delete")
+        self.ui.bind(self.btn_delete.setToolTip, "Delete selected slot (click twice to confirm)")
         self.btn_delete.clicked.connect(self._on_delete)
-        self.btn_add = QPushButton("+  Добавить слот", objectName="edPrimary")
-        self.btn_add.setToolTip("Добавить новый слот в этот день")
+        self.btn_add = QPushButton(objectName="edPrimary")
+        self.ui.bind(self.btn_add.setText, "+  Add slot")
+        self.ui.bind(self.btn_add.setToolTip, "Add a slot to this day")
         self.btn_add.clicked.connect(self.addRequested)
         for b in (self.btn_delete, self.btn_add):
             b.setFont(make_font(12.5, QFont.DemiBold))
@@ -1157,24 +1181,33 @@ class SlotEditor(QFrame):
         self._copy_timer = QTimer(self, singleShot=True, interval=3000)
         self._copy_timer.timeout.connect(self._reset_copy)
         self._status_timer = QTimer(self, singleShot=True, interval=1600)
-        self._status_timer.timeout.connect(lambda: self.status.setText(""))
+        self._status_timer.timeout.connect(self._clear_status)
 
     # ── публичное ──
 
     def set_caption(self, text: str) -> None:
         self.caption.set_full_text(text)
 
-    def set_copy_target(self, name: str | None) -> None:
+    def set_copy_target(self, name: str | None, *, preserve_confirmation=False) -> None:
         """Название другой недели для кнопки копирования; None — кнопка скрыта (режим выключен)."""
         self._copy_target = name
         self.copy_row.setVisible(bool(name))
-        self._reset_copy()
+        if preserve_confirmation and self.btn_copy.property("confirm"):
+            self._update_copy_question()
+        else:
+            self._reset_copy()
 
-    def ask_copy_confirm(self, text: str) -> None:
+    def _update_copy_question(self):
+        n = self._replace_count
+        self.btn_copy.setText(self.ui("Replace {n} {slots} in “{target}”?", n=n,
+                                      slots=self.ui.slots(n), target=self._copy_target))
+        self.btn_copy.setToolTip(self.ui("Click again to replace"))
+
+    def ask_copy_confirm(self, count: int) -> None:
         """В другой неделе в этот день уже есть слоты — второе нажатие подтверждает замену."""
         self.btn_copy.setProperty("confirm", True)
-        self.btn_copy.setText(text)
-        self.btn_copy.setToolTip("Нажмите еще раз, чтобы заменить")
+        self._replace_count = count
+        self._update_copy_question()
         repolish(self.btn_copy)
         self._copy_timer.start()
 
@@ -1183,7 +1216,7 @@ class SlotEditor(QFrame):
         self.ed_cat.clear()
         for name, color in categories.items():
             self.ed_cat.addItem(color_dot_icon(color), name, name)
-        if extra and extra.lower() not in {k.lower() for k in categories}:
+        if extra and extra not in categories:
             self.ed_cat.addItem(color_dot_icon(FALLBACK_COLOR), extra, extra)
         self._loading = False
 
@@ -1196,7 +1229,7 @@ class SlotEditor(QFrame):
         has = item is not None
         for w in (self.ed_time, self.ed_title, self.ed_cat, self.ed_dur, self.btn_delete):
             w.setEnabled(has)
-        cat = str(item.get("category", "")).strip() if has else ""
+        cat = str(item.get("category", "")) if has else ""
         self.set_categories(categories, cat or None)
         self._loading = True
         try:
@@ -1208,7 +1241,7 @@ class SlotEditor(QFrame):
                 self.ed_time.setTime(QTime(t // 60, t % 60))
                 self.ed_title.setText(str(item.get("title", "")))
                 idx = next((i for i in range(self.ed_cat.count())
-                            if self.ed_cat.itemData(i).lower() == cat.lower()), 0)
+                            if self.ed_cat.itemData(i) == cat), 0)
                 self.ed_cat.setCurrentIndex(idx)
                 try:
                     self.ed_dur.setValue(min(1440, max(0, int(item.get("duration") or 0))))
@@ -1217,11 +1250,11 @@ class SlotEditor(QFrame):
             else:
                 self.ed_time.setTime(QTime(12, 0))
                 self.ed_title.clear()
-                self.ed_title.setPlaceholderText("Выберите слот или добавьте новый")
+                self.ui.bind(self.ed_title.setPlaceholderText, "Select a slot or add one")
                 self.ed_cat.setCurrentIndex(-1)
                 self.ed_dur.setValue(0)
             if has:
-                self.ed_title.setPlaceholderText("Название задачи")
+                self.ui.bind(self.ed_title.setPlaceholderText, "Task title")
         finally:
             self._loading = False
 
@@ -1230,11 +1263,17 @@ class SlotEditor(QFrame):
             self.ed_title.setFocus(Qt.OtherFocusReason)
             self.ed_title.selectAll()
 
-    def show_status(self, text: str, error: bool = False) -> None:
+    def _clear_status(self):
+        self.ui.bind(self.status.setText, "")
+
+    def show_status(self, key: str, error: bool = False, detail: str = "", **values) -> None:
         self.status.setProperty("error", error)
         repolish(self.status)
-        self.status.setText(text)
-        self.status.setToolTip(text if error else "")
+        self.ui.bind(self.status.setText, key, **values)
+        if detail:
+            self.ui.bind(self.status.setToolTip, "{detail}", detail=detail)
+        else:
+            self.ui.bind(self.status.setToolTip, key if error else "", **values)
         if error:
             self._status_timer.stop()
         else:
@@ -1265,7 +1304,7 @@ class SlotEditor(QFrame):
             self.deleteRequested.emit()
             return
         self.btn_delete.setProperty("confirm", True)
-        self.btn_delete.setText("Точно удалить?")
+        self.ui.bind(self.btn_delete.setText, "Confirm deletion?")
         repolish(self.btn_delete)
         self._confirm_timer.start()
 
@@ -1273,14 +1312,14 @@ class SlotEditor(QFrame):
         self._confirm_timer.stop()
         if self.btn_delete.property("confirm"):
             self.btn_delete.setProperty("confirm", False)
-            self.btn_delete.setText("Удалить")
+            self.ui.bind(self.btn_delete.setText, "Delete")
             repolish(self.btn_delete)
 
     def _reset_copy(self) -> None:
         self._copy_timer.stop()
         name = self._copy_target or ""
-        self.btn_copy.setText(f"Скопировать этот день в «{name}»")
-        self.btn_copy.setToolTip(f"Скопировать расписание этого дня в другую неделю — «{name}»")
+        self.btn_copy.setText(self.ui("Copy this day to “{name}”", name=name))
+        self.btn_copy.setToolTip(self.ui("Copy this day’s schedule to “{name}” in the other week", name=name))
         if self.btn_copy.property("confirm"):
             self.btn_copy.setProperty("confirm", False)
             repolish(self.btn_copy)
@@ -1328,21 +1367,24 @@ class SettingsPanel(QFrame):
     currentWeekChosen = Signal(int)
     closeRequested = Signal()
 
-    def __init__(self, icon_font: str | None, cfg: WidgetConfig, parent: QWidget | None = None):
+    def __init__(self, icon_font: str | None, cfg: WidgetConfig, ui: InterfaceText, parent: QWidget | None = None):
         super().__init__(parent, objectName="editorCard")
+        self.ui = ui
         lay = QVBoxLayout(self)
         lay.setContentsMargins(12, 9, 8, 12)
         lay.setSpacing(0)
 
         head = QHBoxLayout()
         head.setSpacing(6)
-        caption = QLabel("НАСТРОЙКИ", objectName="editorCaption")
+        caption = QLabel(objectName="editorCaption")
+        self.ui.bind(caption.setText, "SETTINGS")
         caption.setFont(make_font(10.5, QFont.Bold, spacing=0.9))
         self.btn_close = QPushButton(objectName="iconBtn")
         self.btn_close.setFixedSize(26, 26)
         self.btn_close.setFocusPolicy(Qt.StrongFocus)
         self.btn_close.setCursor(Qt.PointingHandCursor)
-        self.btn_close.setToolTip("Готово — закрыть настройки (Esc)")
+        self.ui.bind(self.btn_close.setAccessibleName, "Close settings")
+        self.ui.bind(self.btn_close.setToolTip, "Done — close settings (Esc)")
         if icon_font:
             f = QFont(icon_font)
             f.setPixelSize(12)
@@ -1365,11 +1407,12 @@ class SettingsPanel(QFrame):
         # переключатель режима
         row = QHBoxLayout()
         row.setSpacing(8)
-        lbl = QLabel("Двухнедельный режим", objectName="settingLbl")
+        lbl = QLabel(objectName="settingLbl")
+        self.ui.bind(lbl.setText, "Alternating weeks")
         lbl.setFont(make_font(13.5, QFont.Medium))
         self.sw_biweekly = ToggleSwitch()
-        self.sw_biweekly.setAccessibleName("Двухнедельный режим")
-        self.sw_biweekly.setToolTip("Отдельное расписание для двух чередующихся недель")
+        self.ui.bind(self.sw_biweekly.setAccessibleName, "Alternating weeks")
+        self.ui.bind(self.sw_biweekly.setToolTip, "Separate schedules for two alternating weeks")
         self.sw_biweekly.clicked.connect(lambda: self.biweeklyToggled.emit(self.sw_biweekly.isChecked()))
         row.addWidget(lbl, 1, Qt.AlignVCenter)
         row.addWidget(self.sw_biweekly, 0, Qt.AlignVCenter)
@@ -1387,11 +1430,12 @@ class SettingsPanel(QFrame):
         wl.setSpacing(3)
 
         def cap(text: str) -> QLabel:
-            c = QLabel(text, objectName="fieldCap")
+            c = QLabel(objectName="fieldCap")
+            self.ui.bind(c.setText, text)
             c.setFont(make_font(9.5, QFont.Bold, spacing=0.7))
             return c
 
-        wl.addWidget(cap("НАЗВАНИЯ НЕДЕЛЬ"))
+        wl.addWidget(cap("WEEK NAMES"))
         names = QHBoxLayout()
         names.setSpacing(8)
         self.ed_names: list[QLineEdit] = []
@@ -1399,9 +1443,10 @@ class SettingsPanel(QFrame):
             ed = QLineEdit(objectName="edField")
             ed.setFont(make_font(13))
             ed.setFixedHeight(30)
-            ed.setMaxLength(WEEK_NAME_MAX)
-            ed.setPlaceholderText(DEFAULT_WEEK_NAMES[i])
-            ed.setToolTip("Например, «1 нед.» — пустое поле вернет название по умолчанию")
+            ed.setMaxLength(max(WEEK_NAME_MAX, len(cfg.week_names[i])))
+            self.ui.bind(ed.setPlaceholderText, DEFAULT_WEEK_KEYS[i])
+            self.ui.bind(ed.setAccessibleName, DEFAULT_WEEK_KEYS[i])
+            self.ui.bind(ed.setToolTip, "For example, “Week 1”. Leave blank to use the default name")
             ed.textEdited.connect(lambda text, i=i: self.weekNameEdited.emit(i, text))
             ed.editingFinished.connect(lambda i=i: self.weekNameFinished.emit(i))
             names.addWidget(ed)
@@ -1409,7 +1454,7 @@ class SettingsPanel(QFrame):
         wl.addLayout(names)
         wl.addSpacing(8)
 
-        wl.addWidget(cap("ТЕКУЩАЯ НЕДЕЛЯ СЕЙЧАС — ЭТО"))
+        wl.addWidget(cap("CURRENT WEEK"))
         seg = QFrame(objectName="pillBar")
         sl = QHBoxLayout(seg)
         sl.setContentsMargins(3, 3, 3, 3)
@@ -1450,27 +1495,34 @@ class SettingsPanel(QFrame):
             box.setMinimumHeight(28)
             box.setMinimumWidth(90)
             box.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-            box.setAccessibleName(label)
+            self.ui.bind(box.setAccessibleName, label)
             for title, value in options:
                 box.addItem(title, value)
+                if key != "language" and (key != "font_family" or value == ""):
+                    self.ui.bind(partial(box.setItemText, box.count() - 1), title)
             box.setCurrentIndex(max(0, box.findData(getattr(cfg, key))))
             box.activated.connect(lambda i: self.appearanceChanged.emit(key, box.itemData(i)))
             form.addRow(label, box)
+            self.ui.bind(form.labelForField(box).setText, label)
             return box
 
+        self.language_box = choices("Language", "language", [("Русский", "ru"), ("English", "en")])
         families = QFontDatabase.families(QFontDatabase.Cyrillic)
-        self.font_box = choices("Шрифт", "font_family", [("По умолчанию", "")] + [(f, f) for f in families])
-        self.size_box = choices("Размер текста", "font_offset", [(n, i) for i, n in
-                                enumerate(("Мелкий", "Обычный", "Средний", "Крупный", "Очень крупный"), -1)])
-        self.accent_btn = QPushButton("Выбрать цвет…", objectName="edGhost")
+        self.font_box = choices("Font", "font_family", [("Default", "")] + [(f, f) for f in families])
+        self.size_box = choices("Text size", "font_offset", [(n, i) for i, n in
+                                enumerate(("Small", "Normal", "Medium", "Large", "Extra large"), -1)])
+        self.accent_btn = QPushButton(objectName="edGhost")
+        self.ui.bind(self.accent_btn.setText, "Choose color…")
         self.accent_btn.setMinimumHeight(28)
         self.accent_btn.setIcon(color_dot_icon(cfg.accent))
         def choose_accent():
-            color = QColorDialog.getColor(QColor(cfg.accent), self, "Цвет акцента")
+            color = QColorDialog.getColor(QColor(cfg.accent), self, self.ui("Accent color"),
+                                          QColorDialog.DontUseNativeDialog)
             if color.isValid():
                 self.appearanceChanged.emit("accent", color.name())
         self.accent_btn.clicked.connect(choose_accent)
-        form.addRow("Акцент", self.accent_btn)
+        form.addRow("Accent", self.accent_btn)
+        self.ui.bind(form.labelForField(self.accent_btn).setText, "Accent")
 
         def number(label, key, low, high, step, suffix):
             box = QSpinBox()
@@ -1479,45 +1531,57 @@ class SettingsPanel(QFrame):
             box.setSingleStep(step)
             box.setValue(getattr(cfg, key))
             box.setKeyboardTracking(False)
-            box.setAccessibleName(label)
+            self.ui.bind(box.setAccessibleName, label)
             box.valueChanged.connect(lambda value: self.appearanceChanged.emit(key, value))
             form.addRow(label, box)
+            self.ui.bind(form.labelForField(box).setText, label)
             return box
 
-        self.bg_box = choices("Фон", "background", [("Графит", "#141418"), ("Сине-серый", "#17232e"),
-                                                       ("Тёплый серый", "#24201e")])
-        self.width_box = number("Ширина виджета", "width", 392, 640, 8, " px")
-        self.opacity_box = number("Непрозрачность фона", "opacity", 45, 100, 5, " %")
+        self.bg_box = choices("Background", "background", [("Graphite", "#141418"), ("Blue gray", "#17232e"),
+                                                       ("Warm gray", "#24201e")])
+        self.width_box = number("Widget width", "width", 392, 640, 8, " px")
+        self.opacity_box = number("Background opacity", "opacity", 45, 100, 5, " %")
         self.cat_box = QComboBox()
         self.cat_box.setEditable(True)
         self.cat_box.setInsertPolicy(QComboBox.NoInsert)
-        self.cat_box.setToolTip("Чтобы добавить категорию, введите новое название и нажмите «Цвет…»")
+        self.ui.bind(self.cat_box.setToolTip, "To add a category, enter a name and click “Color…”")
         self.cat_box.lineEdit().setMaxLength(48)
-        self.cat_box.setAccessibleName("Категория")
-        self.cat_button = QPushButton("Цвет…", objectName="edGhost")
-        self.cat_button.clicked.connect(lambda: self.categoryRequested.emit(self.cat_box.currentText().strip()))
+        self.ui.bind(self.cat_box.setAccessibleName, "Category")
+        self.cat_button = QPushButton(objectName="edGhost")
+        self.ui.bind(self.cat_button.setText, "Color…")
+        def choose_category():
+            box = self.cat_box
+            name = box.currentText()
+            if box.currentIndex() >= 0 and name == box.itemText(box.currentIndex()):
+                name = box.currentData()
+            self.categoryRequested.emit(name)
+        self.cat_button.clicked.connect(choose_category)
         cat_row = QHBoxLayout()
         cat_row.addWidget(self.cat_box, 1)
         cat_row.addWidget(self.cat_button)
-        form.addRow("Категория", cat_row)
-        reset = QPushButton("Сбросить оформление", objectName="edGhost")
+        form.addRow("Category", cat_row)
+        self.ui.bind(form.labelForField(cat_row).setText, "Category")
+        reset = QPushButton(objectName="edGhost")
+        self.ui.bind(reset.setText, "Reset appearance")
         reset.setMinimumHeight(28)
         reset.clicked.connect(lambda: self.appearanceChanged.emit("reset", None))
         form.addRow(reset)
         elements = QWidget()
         content = QVBoxLayout(elements)
         self.display_boxes = {}
-        for key, label in (("show_clock", "Часы в шапке"), ("show_categories", "Названия категорий в списке"),
-                           ("dense", "Уменьшенные отступы в списке")):
-            box = QCheckBox(label)
+        for key, label in (("show_clock", "Show clock in header"), ("show_categories", "Show category names in list"),
+                           ("dense", "Compact list spacing")):
+            box = QCheckBox()
+            self.ui.bind(box.setText, label)
             box.setChecked(getattr(cfg, key))
             box.clicked.connect(lambda on, key=key: self.appearanceChanged.emit(key, on))
             content.addWidget(box)
             self.display_boxes[key] = box
         content.addStretch()
         pages = (schedule_tab, appearance, elements)
-        for index, (label, page) in enumerate(zip(("Расписание", "Оформление", "Элементы"), pages)):
+        for index, (label, page) in enumerate(zip(("Schedule", "Appearance", "Elements"), pages)):
             self.tabs.addTab(label)
+            self.ui.bind(partial(self.tabs.setTabText, index), label)
             lay.addWidget(page)
             page.setVisible(index == 0)
 
@@ -1539,26 +1603,24 @@ class SettingsPanel(QFrame):
         self.sw_biweekly.setChecked(biweekly)
         self.sw_biweekly.update()
         self.mode_hint.setText(
-            f"Расписание чередуется: «{names[0]}» и «{names[1]}»." if biweekly
-            else "Одно расписание на все недели. Включите, если недели чередуются.")
+            self.ui("The schedule alternates between “{a}” and “{b}”.", a=names[0], b=names[1]) if biweekly
+            else self.ui("One schedule for every week. Enable this if your weeks alternate."))
         mode_changed = self.weeks_box.isHidden() == biweekly
         self.weeks_box.setVisible(biweekly)
         for ed, raw in zip(self.ed_names, raw_names):
-            if ed.text().strip() != raw.strip():  # не сбиваем курсор, пока человек печатает
+            if ed.text() != raw:  # не сбиваем курсор, пока человек печатает
                 ed.setText(raw)
         for i, b in enumerate(self.cur_group.buttons()):
             b.setText(names[i])
-            b.setToolTip(f"Отметить эту неделю как «{names[i]}» — дальше недели "
-                         "будут переключаться автоматически каждый понедельник")
+            b.setToolTip(self.ui("Set this week to “{name}”. Weeks will alternate every Monday.", name=names[i]))
         btn = self.cur_group.button(current)
         if btn and not btn.isChecked():
             btn.setChecked(True)
         if anchor is not None:
             self.anchor_hint.setText(
-                f"Опорный понедельник — {anchor.day} {MONTHS[anchor.month - 1]} {anchor.year} "
-                f"(«{names[anchor_week]}»). Дальше недели меняются автоматически.")
+                self.ui("Reference Monday: {date} (“{name}”). Weeks alternate automatically.", date=self.ui.date(anchor, year=True), name=names[anchor_week]))
         else:
-            self.anchor_hint.setText("Недели меняются автоматически каждый понедельник.")
+            self.anchor_hint.setText(self.ui("Weeks alternate automatically every Monday."))
         if mode_changed:
             self.contentSizeChanged.emit()
 
@@ -1722,17 +1784,22 @@ def set_flag_prop(w: QWidget, name: str, value: bool) -> None:
 
 
 class ScheduleWidget(QWidget):
+    languageChanged = Signal()
     MINI_WIDTH = 340
     MARGIN = 14
 
     def __init__(self):
         super().__init__(None, Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setWindowTitle("Расписание")
+
         self.setWindowIcon(make_app_icon())
         self.setFocusPolicy(Qt.ClickFocus)
 
         self.cfg = WidgetConfig.load(CONFIG_PATH)
+        self.ui = InterfaceText(self.cfg.language)
+        self._qt_translator = QTranslator(self)
+        self._set_qt_language()
+        self.ui.bind(self.setWindowTitle, "Schedule")
         self._apply_theme()
         self.setFixedWidth(self.cfg.width)
         if self.cfg.biweekly and self.cfg.week_anchor is None:
@@ -1756,7 +1823,7 @@ class ScheduleWidget(QWidget):
         self._today: int | None = None      # индекс сегодняшнего дня в ленте
         self._selected = current_time().weekday()       # выбранный день недели 0..6
         self._view_week = self._current_week()          # просматриваемая неделя 0 / 1
-        self._error: str | None = None
+        self._error: Exception | None = None
         self._press_pos: QPoint | None = None  # точка нажатия ЛКМ для перетаскивания
         self._icon_font = icon_font_family()
         self._desk = DesktopLayer(self) if IS_WINDOWS else None
@@ -1834,7 +1901,41 @@ class ScheduleWidget(QWidget):
         palette.setColor(QPalette.Highlight, ACCENT)
         app.setPalette(palette)
 
+    def _set_qt_language(self):
+        app = QApplication.instance()
+        app.removeTranslator(self._qt_translator)
+        QLocale.setDefault(self.ui.locale)
+        self.setLocale(self.ui.locale)
+        if self.cfg.language == "ru":
+            path = QLibraryInfo.path(QLibraryInfo.TranslationsPath)
+            if self._qt_translator.load("qtbase_ru", path):
+                app.installTranslator(self._qt_translator)
+
+    def set_language(self, language: str) -> None:
+        if language not in ("ru", "en") or self.cfg.language == language:
+            return
+        self.cfg.language = language
+        self.ui.set_language(language)
+        self._set_qt_language()
+        box = self.settings.language_box
+        box.setCurrentIndex(box.findData(language))
+        for i in range(7):
+            button = self.pills.button(i)
+            button.setText(self.ui.weekday(i, short=True))
+            button.setToolTip(self.ui.weekday(i))
+            button.setAccessibleName(self.ui.weekday(i))
+        self._sync_week_ui(preserve_confirmation=True)
+        self._translate_category_choices()
+        self._update_list_text()
+        self.refresh()
+        self._fit_height()
+        self.languageChanged.emit()
+        self._save_config()
+
     def _change_appearance(self, key: str, value) -> None:
+        if key == "language":
+            self.set_language(value)
+            return
         panel = self.settings
         if key == "reset":
             defaults = WidgetConfig()
@@ -1869,23 +1970,41 @@ class ScheduleWidget(QWidget):
     def _choose_category_color(self, name: str) -> None:
         if not name or self._error:
             return
-        name = next((k for k in self.categories if k.casefold() == name.casefold()), name)
-        color = QColorDialog.getColor(self.color_for(name), self, f"Цвет категории «{name}»")
+        label = self.settings.cat_box.currentText()
+        color = QColorDialog.getColor(self.color_for(name), self, self.ui("Color for “{name}”", name=label),
+                                      QColorDialog.DontUseNativeDialog)
         if color.isValid():
             self.file_categories[name] = self.categories[name] = color.name()
             self._dirty = True
-            if not self._commit():
-                self.lbl_error.setText("Не удалось сохранить цвет категории в schedule.json")
-                self.lbl_error.show()
+            self._category_error = not self._commit()
+            self._show_file_errors()
             self._sync_categories(name)
+
+    def _translate_category_choices(self):
+        # A category explicitly named in JSON is user text, even if it matches the preset.
+        key = "Общее"
+        explicit = key in self.file_categories or any(
+            isinstance(item, dict) and item.get("category") == key
+            for days in (self.raw_single, *self.raw_weeks) for day in days for item in day)
+        label = key if explicit else self.ui("General")
+        for box in (self.settings.cat_box, self.editor.ed_cat):
+            index = box.findData(key)
+            if index >= 0 and box.itemText(index) != label:
+                draft = None
+                if box.isEditable() and box.currentText() != box.itemText(box.currentIndex()):
+                    draft = box.currentText()
+                box.setItemText(index, label)
+                if draft is not None:
+                    box.setEditText(draft)
 
     def _sync_categories(self, selected="") -> None:
         box = self.settings.cat_box
         box.clear()
         for name, color in self.categories.items():
-            box.addItem(color_dot_icon(color), name)
+            box.addItem(color_dot_icon(color), name, name)
+        self._translate_category_choices()
         if selected:
-            box.setCurrentText(selected)
+            box.setCurrentIndex(box.findData(selected))
         self.settings.cat_button.setEnabled(not self._error)
 
     def _build_ui(self) -> None:
@@ -1929,22 +2048,27 @@ class ScheduleWidget(QWidget):
         hdr.addSpacing(6)
 
         self.btn_edit = self._icon_button("iconBtn", G_EDIT)
-        self.btn_edit.setToolTip("Редактировать расписание (или двойной клик по слоту)")
+        self.ui.bind(self.btn_edit.setToolTip, "Edit schedule (or double-click a slot)")
+        self.ui.bind(self.btn_edit.setAccessibleName, "Edit schedule")
         self.btn_edit.clicked.connect(self.toggle_editor)
         self.btn_settings = self._icon_button("iconBtn", G_SETTINGS)
-        self.btn_settings.setToolTip("Настройки расписания и оформления")
-        self.btn_settings.setAccessibleName("Настройки")
+        self.ui.bind(self.btn_settings.setToolTip, "Schedule and appearance settings")
+        self.ui.bind(self.btn_settings.setAccessibleName, "Settings")
         self.btn_settings.clicked.connect(self.toggle_settings)
         self.btn_lock = self._icon_button("iconBtn", G_UNLOCKED)
+        self.ui.bind(self.btn_lock.setAccessibleName, "Lock position")
         self.btn_lock.clicked.connect(lambda: self.set_locked(not self.cfg.locked))
         self.btn_level = self._icon_button("iconBtn", G_ON_DESKTOP)
+        self.ui.bind(self.btn_level.setAccessibleName, "Window level")
         self.btn_level.clicked.connect(lambda: self.set_window_level(
             LEVEL_DESKTOP if self.cfg.window_level == LEVEL_TOP else LEVEL_TOP))
         self.btn_collapse = self._icon_button("iconBtn", G_COLLAPSE)
-        self.btn_collapse.setToolTip("Свернуть в мини-плашку")
+        self.ui.bind(self.btn_collapse.setToolTip, "Switch to compact view")
+        self.ui.bind(self.btn_collapse.setAccessibleName, "Switch to compact view")
         self.btn_collapse.clicked.connect(lambda: self.set_compact(True))
         self.btn_close = self._icon_button("closeBtn", G_CLOSE)
-        self.btn_close.setToolTip("Закрыть")
+        self.ui.bind(self.btn_close.setToolTip, "Close")
+        self.ui.bind(self.btn_close.setAccessibleName, "Close")
         self.btn_close.clicked.connect(self.quit_app)
         for b in (self.btn_edit, self.btn_settings, self.btn_lock, self.btn_level, self.btn_collapse, self.btn_close):
             hdr.addWidget(b, 0, Qt.AlignVCenter)
@@ -1978,15 +2102,16 @@ class ScheduleWidget(QWidget):
         bl.setSpacing(2)
         self.pills = QButtonGroup(self)
         self.pills.setExclusive(True)
-        for i, name in enumerate(DAY_SHORT):
-            b = QPushButton(name, objectName="pill")
+        for i in range(7):
+            b = QPushButton(self.ui.weekday(i, short=True), objectName="pill")
             b.setCheckable(True)
             b.setFocusPolicy(Qt.StrongFocus)
             b.setCursor(Qt.PointingHandCursor)
             b.setFont(make_font(12, QFont.DemiBold))
             b.setFixedHeight(26)
             b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            b.setToolTip(DAY_FULL[i])
+            b.setToolTip(self.ui.weekday(i))
+            b.setAccessibleName(self.ui.weekday(i))
             self.pills.addButton(b, i)
             bl.addWidget(b)
         self.pills.idClicked.connect(self.select_day)
@@ -2027,7 +2152,7 @@ class ScheduleWidget(QWidget):
         top.addWidget(self.status)
 
         # Редактор открывается на месте карточки «сейчас»
-        self.editor = SlotEditor(self._icon_font)
+        self.editor = SlotEditor(self._icon_font, self.ui)
         self.editor.hide()
         self.editor.fieldChanged.connect(self._on_field_changed)
         self.editor.addRequested.connect(self.add_slot)
@@ -2037,7 +2162,7 @@ class ScheduleWidget(QWidget):
         top.addWidget(self.editor)
 
         # Настройки двухнедельного режима — тоже на месте карточки «сейчас»
-        self.settings = SettingsPanel(self._icon_font, self.cfg)
+        self.settings = SettingsPanel(self._icon_font, self.cfg, self.ui)
         # Пересчитать список после того, как Qt обновит геометрию показанных полей.
         self.settings.contentSizeChanged.connect(self._fit_height, Qt.QueuedConnection)
         self.settings.appearanceChanged.connect(self._change_appearance)
@@ -2053,6 +2178,7 @@ class ScheduleWidget(QWidget):
         self.lbl_error = QLabel(objectName="errorLbl")
         self.lbl_error.setFont(make_font(11.5))
         self.lbl_error.setWordWrap(True)
+        self.lbl_error.setTextFormat(Qt.PlainText)
         self.lbl_error.hide()
         top.addWidget(self.lbl_error)
         root.addWidget(self.top)
@@ -2096,7 +2222,8 @@ class ScheduleWidget(QWidget):
         col.addWidget(self.mini_progress)
 
         self.btn_expand = self._icon_button("iconBtn", G_EXPAND)
-        self.btn_expand.setToolTip("Развернуть")
+        self.ui.bind(self.btn_expand.setToolTip, "Expand")
+        self.ui.bind(self.btn_expand.setAccessibleName, "Expand")
         self.btn_expand.clicked.connect(lambda: self.set_compact(False))
 
         ml.addWidget(self.mini_dot, 0, Qt.AlignVCenter)
@@ -2143,36 +2270,43 @@ class ScheduleWidget(QWidget):
             set_autostart(on)
         except OSError as e:
             if getattr(self, "tray", None):
-                self.tray.showMessage("Автозапуск", f"Не удалось изменить автозапуск: {e}",
-                                      QSystemTrayIcon.Warning, 5000)
+                detail = str(e) if IS_WINDOWS else self.ui("Startup is only supported on Windows")
+                message = self.ui("Could not change startup settings: {error}", error=detail)
+                self.tray.showMessage(self.ui("Startup"), message, QSystemTrayIcon.Warning, 5000)
+
+    def _menu_action(self, menu, key):
+        action = menu.addAction("")
+        self.ui.bind(action.setText, key)
+        return action
 
     def _build_tray_menu(self) -> QMenu:
         """Короткое меню иконки в трее."""
         menu = self._styled_menu()
-        act_toggle = menu.addAction("Скрыть")
+        act_toggle = self._menu_action(menu, "Hide")
         act_toggle.triggered.connect(self.toggle_visible)
         menu.addSeparator()
-        act_lock = menu.addAction("Зафиксировать позицию")
+        act_lock = self._menu_action(menu, "Lock position")
         act_lock.setCheckable(True)
         act_lock.triggered.connect(lambda: self.set_locked(not self.cfg.locked))
-        act_auto = menu.addAction("Автозапуск с Windows")
+        act_auto = self._menu_action(menu, "Start with Windows")
         act_auto.setCheckable(True)
         act_auto.setEnabled(IS_WINDOWS)
         act_auto.triggered.connect(lambda: self.set_autostart(not autostart_enabled()))
         menu.addSeparator()
-        menu.addAction("Настройки…").triggered.connect(self.open_settings)
-        menu.addAction("Открыть папку с JSON").triggered.connect(self.open_data_folder)
+        self._menu_action(menu, "Settings…").triggered.connect(self.open_settings)
+        self._menu_action(menu, "Open JSON folder").triggered.connect(self.open_data_folder)
         menu.addSeparator()
-        menu.addAction("Выход").triggered.connect(self.quit_app)
+        self._menu_action(menu, "Quit").triggered.connect(self.quit_app)
 
         def sync() -> None:
             auto = autostart_enabled()  # читаем реестр заново: запись могли изменить извне
-            act_toggle.setText("Скрыть" if self.isVisible() else "Показать")
+            act_toggle.setText(self.ui("Hide") if self.isVisible() else self.ui("Show"))
             act_lock.setChecked(self.cfg.locked)
-            act_lock.setText(self._mark(self.cfg.locked, "Зафиксировать позицию"))
+            act_lock.setText(self._mark(self.cfg.locked, self.ui("Lock position")))
             act_auto.setChecked(auto)
-            act_auto.setText(self._mark(auto, "Автозапуск с Windows"))
+            act_auto.setText(self._mark(auto, self.ui("Start with Windows")))
 
+        self.languageChanged.connect(sync)
         menu.aboutToShow.connect(sync)
         return menu
 
@@ -2180,50 +2314,52 @@ class ScheduleWidget(QWidget):
         menu = self._styled_menu()
 
         def add(text: str, fn) -> None:
-            menu.addAction(text).triggered.connect(fn)
+            self._menu_action(menu, text).triggered.connect(fn)
 
-        self.act_toggle = menu.addAction("Скрыть виджет")
+        self.act_toggle = self._menu_action(menu, "Hide widget")
         self.act_toggle.triggered.connect(self.toggle_visible)
-        add("Сегодня", self.go_today)
-        self.act_compact = menu.addAction("Свернуть в мини-плашку")
+        add("Today", self.go_today)
+        self.act_compact = self._menu_action(menu, "Switch to compact view")
         self.act_compact.triggered.connect(lambda: self.set_compact(not self.cfg.compact))
         menu.addSeparator()
-        self.act_lock = menu.addAction("Зафиксировать позицию")
+        self.act_lock = self._menu_action(menu, "Lock position")
         self.act_lock.triggered.connect(lambda: self.set_locked(not self.cfg.locked))
-        self.act_top = menu.addAction("Поверх всех окон")
+        self.act_top = self._menu_action(menu, "Always on top")
         self.act_top.triggered.connect(lambda: self.set_window_level(LEVEL_TOP))
-        self.act_desktop = menu.addAction("На рабочем столе")
+        self.act_desktop = self._menu_action(menu, "On desktop")
         self.act_desktop.triggered.connect(lambda: self.set_window_level(LEVEL_DESKTOP))
-        self.act_autostart = menu.addAction("Автозапуск с Windows")
+        self.act_autostart = self._menu_action(menu, "Start with Windows")
         self.act_autostart.setEnabled(IS_WINDOWS)
         self.act_autostart.triggered.connect(lambda: self.set_autostart(not autostart_enabled()))
         menu.addSeparator()
-        self.act_biweekly = menu.addAction("Двухнедельный режим")
+        self.act_biweekly = self._menu_action(menu, "Alternating weeks")
         self.act_biweekly.triggered.connect(lambda: self.set_biweekly(not self.cfg.biweekly))
-        self.act_settings = menu.addAction("Настройки…")
+        self.act_settings = self._menu_action(menu, "Settings…")
         self.act_settings.triggered.connect(self.toggle_settings)
         menu.addSeparator()
-        self.act_edit = menu.addAction("Редактировать расписание")
+        self.act_edit = self._menu_action(menu, "Edit schedule")
         self.act_edit.triggered.connect(self.toggle_editor)
-        add("Открыть schedule.json", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(SCHEDULE_PATH))))
-        add("Открыть папку с JSON", self.open_data_folder)
-        add("Перечитать расписание", self.reload)
+        add("Import schedule…", self.import_schedule)
+        add("Open schedule.json", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(SCHEDULE_PATH))))
+        add("Open JSON folder", self.open_data_folder)
+        add("Reload schedule", self.reload)
         menu.addSeparator()
-        add("Выход", self.quit_app)
+        add("Quit", self.quit_app)
 
         mark = self._mark
 
         def sync() -> None:
-            self.act_autostart.setText(mark(autostart_enabled(), "Автозапуск с Windows"))
-            self.act_lock.setText(mark(self.cfg.locked, "Зафиксировать позицию"))
-            self.act_top.setText(mark(self.cfg.window_level == LEVEL_TOP, "Поверх всех окон"))
-            self.act_desktop.setText(mark(self.cfg.window_level == LEVEL_DESKTOP, "На рабочем столе"))
-            self.act_compact.setText("Развернуть" if self.cfg.compact else "Свернуть в мини-плашку")
-            self.act_toggle.setText("Скрыть виджет" if self.isVisible() else "Показать виджет")
-            self.act_edit.setText("Закрыть редактор" if self._editing else "Редактировать расписание")
-            self.act_biweekly.setText(mark(self.cfg.biweekly, "Двухнедельный режим"))
-            self.act_settings.setText("Закрыть настройки" if self._settings_open else "Настройки…")
+            self.act_autostart.setText(mark(autostart_enabled(), self.ui("Start with Windows")))
+            self.act_lock.setText(mark(self.cfg.locked, self.ui("Lock position")))
+            self.act_top.setText(mark(self.cfg.window_level == LEVEL_TOP, self.ui("Always on top")))
+            self.act_desktop.setText(mark(self.cfg.window_level == LEVEL_DESKTOP, self.ui("On desktop")))
+            self.act_compact.setText(self.ui("Expand") if self.cfg.compact else self.ui("Switch to compact view"))
+            self.act_toggle.setText(self.ui("Hide widget") if self.isVisible() else self.ui("Show widget"))
+            self.act_edit.setText(self.ui("Close editor") if self._editing else self.ui("Edit schedule"))
+            self.act_biweekly.setText(mark(self.cfg.biweekly, self.ui("Alternating weeks")))
+            self.act_settings.setText(self.ui("Close settings") if self._settings_open else self.ui("Settings…"))
 
+        self.languageChanged.connect(sync)
         menu.aboutToShow.connect(sync)
         return menu
 
@@ -2236,13 +2372,94 @@ class ScheduleWidget(QWidget):
         self.tray.setContextMenu(self.tray_menu)
         self.tray.activated.connect(  # одиночный клик по иконке — показать / спрятать
             lambda reason: self.toggle_visible() if reason == QSystemTrayIcon.Trigger else None)
-        self.tray.setToolTip("Расписание")
+        self.tray.setToolTip(self.ui("Schedule"))
         self.tray.show()
         self._on_tick()  # обновить подсказку трея
 
     # ── данные ─────────────────────────────────────────────────────────────
 
+    def import_schedule(self) -> None:
+        pending_edit = self._commit_timer.isActive()
+        self._commit_timer.stop()
+        try:
+            path, _ = QFileDialog.getOpenFileName(self, self.ui("Import schedule…"), str(APP_DIR),
+                                                  self.ui("JSON files (*.json);;All files (*)"),
+                                                  options=QFileDialog.DontUseNativeDialog)
+            if path:
+                self._import_file(Path(path))
+        finally:
+            if pending_edit and self._dirty:
+                self._commit_timer.start()
+
+    def _import_file(self, path: Path) -> None:
+        try:
+            candidate = parse_schedule(path.read_text(encoding="utf-8-sig"))
+            text = candidate.sorted_text()
+            # Check encodability before displaying JSON strings with unpaired surrogates.
+            text.encode("utf-8")
+            preview = self._compare_import(candidate)
+            revised = False
+            while True:
+                if preview is None:
+                    QMessageBox.information(self, self.ui("Import schedule…"), self.ui("No changes."))
+                    return
+                if not self._confirm_import(path, *preview, revised):
+                    return
+                latest = self._compare_import(candidate)
+                if latest == preview:
+                    break
+                preview, revised = latest, True
+        except (OSError, ValueError, RecursionError) as error:
+            QMessageBox.warning(self, self.ui("Import schedule…"),
+                                self.ui("Could not import schedule: {error}", error=self._file_error_detail(error)))
+            return
+        try:
+            write_text_atomic(SCHEDULE_PATH, text)
+        except OSError as error:
+            QMessageBox.warning(self, self.ui("Import schedule…"),
+                                self.ui("Could not save schedule.json: {error}", error=self._file_error_detail(error)))
+            return
+        self._reload_from_text(text)
+        self._watch_file()
+
+    def _compare_import(self, candidate: ScheduleData):
+        # The watcher is debounced. An external save can already be on disk
+        # while the widget still shows the previous version.
+        text = SCHEDULE_PATH.read_text(encoding="utf-8-sig")
+        current = self._current_schedule() if text == self._loaded_text else parse_schedule(text)
+        return schedule_changes(current, candidate, self.ui, slot_sort_key)
+
+    def _confirm_import(self, path: Path, summary: str, details: str, revised: bool) -> bool:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(self.ui("Import schedule…"))
+        layout = QVBoxLayout(dialog)
+        heading = self.ui("Replace the entire schedule with “{name}”?", name=path.name)
+        if revised:
+            heading = self.ui("The current schedule changed. Review the updated comparison.") + "\n" + heading
+        label = QLabel(heading + "\n\n" + summary)
+        label.setTextFormat(Qt.PlainText)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        report = QPlainTextEdit()
+        report.setReadOnly(True)
+        report.setAccessibleName(self.ui("Schedule changes"))
+        report.setPlainText(details)
+        layout.addWidget(report)
+        buttons = QDialogButtonBox()
+        buttons.addButton(self.ui("Import"), QDialogButtonBox.AcceptRole)
+        cancel = buttons.addButton(self.ui("Cancel"), QDialogButtonBox.RejectRole)
+        cancel.setDefault(True)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.resize(640, 460)
+        try:
+            return dialog.exec() == QDialog.Accepted
+        finally:
+            dialog.deleteLater()
+
     def _load(self, text: str | None = None) -> None:
+        self._editor_blocked = self._category_error = False
         migrated = False
         try:
             if text is None:
@@ -2256,20 +2473,14 @@ class ScheduleWidget(QWidget):
                         pass
                 text = SCHEDULE_PATH.read_text(encoding="utf-8-sig")
             data = parse_schedule(text.lstrip("﻿"))
-            weeks = []
-            for wk in data.weeks:
-                if wk is None:
-                    # миграция: недель А/Б в файле еще нет — обе начинаются с копии прежнего расписания
-                    wk = copy.deepcopy(data.days)
-                    migrated = True
-                weeks.append(wk)
-            self.raw_single, self.raw_weeks = data.days, weeks
+            migrated = data.needs_migration
+            self.raw_single, self.raw_weeks = data.days, data.weeks
             self.file_categories, self.categories = data.file_categories, data.categories
             self._loaded_text = text
             self._error = None
         except (OSError, ValueError) as e:  # json.JSONDecodeError — подкласс ValueError
             self._loaded_text = None
-            self._error = f"Не удалось загрузить расписание: {e}"
+            self._error = e
         self._sync_categories()
         self._rebuild_timeline()
         if migrated:
@@ -2288,6 +2499,9 @@ class ScheduleWidget(QWidget):
         self._watch_file()
         if text is not None and text == self._loaded_text:
             return  # это наша собственная запись из редактора — всё уже на экране
+        self._reload_from_text(text)
+
+    def _reload_from_text(self, text: str | None) -> None:
         self._commit_timer.stop()  # файл изменили снаружи — он главнее несохраненной правки
         page = self._page()
         self._load(text)
@@ -2318,15 +2532,12 @@ class ScheduleWidget(QWidget):
             self._view_week = 0
         self.days = build_slots(self.raw_days)
 
+    def _current_schedule(self) -> ScheduleData:
+        return ScheduleData(self.raw_single, self.raw_weeks, self.file_categories, self.categories)
+
     def _write_schedule(self) -> OSError | None:
         """Отсортировать слоты по времени и записать schedule.json. Возвращает ошибку записи."""
-        for items in (*self.raw_single, *self.raw_weeks[0], *self.raw_weeks[1]):
-            items.sort(key=slot_sort_key)
-        text = dump_schedule({
-            "categories": self.file_categories,
-            "days": dict(zip(DAY_KEYS, self.raw_single)),
-            "weeks": {k: dict(zip(DAY_KEYS, wk)) for k, wk in zip(WEEK_KEYS, self.raw_weeks)},
-        })
+        text = self._current_schedule().sorted_text()
         try:
             write_text_atomic(SCHEDULE_PATH, text)
         except OSError as e:
@@ -2362,9 +2573,7 @@ class ScheduleWidget(QWidget):
             lay.addWidget(card)
             row.append(card)
         if not row:
-            hint = ("Пусто — нажмите «Добавить слот»" if self._editing
-                    else "На этот день ничего не запланировано")
-            empty = QLabel(hint, objectName="emptyLbl")
+            empty = QLabel(objectName="emptyLbl")
             empty.setFont(make_font(12.5))
             empty.setAlignment(Qt.AlignCenter)
             empty.setMinimumHeight(80)
@@ -2373,6 +2582,17 @@ class ScheduleWidget(QWidget):
         self.scroll.setWidget(page)
         page.setAutoFillBackground(False)
         self.cards = row
+        self._update_list_text()
+
+    def _update_list_text(self) -> None:
+        for card in self.cards:
+            card.badge.setText(self.ui("NOW"))
+            card.lbl_title.setText(self.slot_title(card.slot))
+            card.lbl_cat.setText(self.slot_category(card.slot))
+        if not self.cards:
+            label = self.scroll.widget().findChild(QLabel, "emptyLbl")
+            key = "Empty — click “Add slot”" if self._editing else "Nothing scheduled for this day"
+            label.setText(self.ui(key))
 
     def _fit_height(self) -> None:
         content_w = self.cfg.width - 2 * (self.MARGIN - GLOW)
@@ -2439,10 +2659,18 @@ class ScheduleWidget(QWidget):
         if self.cfg.biweekly and self._view_week != self._current_week(now.date()):
             offset += 7  # другая неделя — показываем даты ближайшей такой недели (следующей)
         day = now.date() + timedelta(days=offset)
-        date_s = f"{day.day} {MONTHS[day.month - 1]}"
-        rel = {0: "Сегодня", 1: "Завтра", -1: "Вчера"}.get(offset)
-        self.lbl_day.set_full_text(DAY_FULL[d])
+        date_s = self.ui.date(day)
+        rel = {0: self.ui("Today"), 1: self.ui("Tomorrow"), -1: self.ui("Yesterday")}.get(offset)
+        self.lbl_day.set_full_text(self.ui.weekday(d))
         self.lbl_date.setText(f"{rel} · {date_s}" if rel else date_s)
+
+    def slot_title(self, slot: Slot) -> str:
+        return slot.title if slot.title.strip() else self.ui("Untitled")
+
+    def slot_category(self, slot: Slot) -> str:
+        if slot.ref is not None and "category" not in slot.ref and "Общее" not in self.file_categories:
+            return self.ui("General")
+        return slot.category
 
     def _update_status(self, wd: int, minute: int, active: tuple[int, int] | None) -> None:
         nxt = find_next(self.days, wd, minute)
@@ -2452,29 +2680,29 @@ class ScheduleWidget(QWidget):
             s = self.days[d][i]
             mm = minute if d == wd else minute + 1440
             color = self.color_for(s.category)
-            caption = f"СЕЙЧАС · {s.category.upper()}"
-            title = s.title
+            caption = self.ui("NOW · {category}", category=self.slot_category(s))
+            title = self.slot_title(s)
             rng = f"{fmt_time(s.start)} – {fmt_time(s.end)}"
-            sub = f"Осталось {human(s.end - mm)}"
+            sub = self.ui("{time} remaining", time=self.ui.duration(s.end - mm))
             if nxt:
-                sub += f"  ·  далее {nxt[0].title}"
+                sub += self.ui("  ·  next: {title}", title=self.slot_title(nxt[0]))
             progress = (mm - s.start) / max(1, s.end - s.start)
-            mini_title, mini_left = s.title, f"ещё {human(s.end - mm)}"
-            mini_tip = f"{s.title}\n{rng} · осталось {human(s.end - mm)}"
+            mini_title, mini_left = self.slot_title(s), self.ui("{time} left", time=self.ui.duration(s.end - mm))
+            mini_tip = self.ui("{title}\n{span} · {time} left", title=title, span=rng, time=self.ui.duration(s.end - mm))
         elif nxt:
             s, mins = nxt
             color = QColor(FALLBACK_COLOR)
-            caption = "СВОБОДНО"
-            title = "Свободное время"
-            rng = f"до {fmt_time(s.start)}"
-            sub = f"Далее {s.title} через {human(mins)}"
-            mini_title, mini_left = "Свободно", f"через {human(mins)}"
-            mini_tip = f"Свободное время {rng}\nДалее: {s.title}"
+            caption = self.ui("FREE")
+            title = self.ui("Free time")
+            rng = self.ui("until {time}", time=fmt_time(s.start))
+            sub = self.ui("Next: {title} in {time}", title=self.slot_title(s), time=self.ui.duration(mins))
+            mini_title, mini_left = self.ui("Free"), self.ui("in {time}", time=self.ui.duration(mins))
+            mini_tip = self.ui("Free time {span}\nNext: {title}", span=rng, title=self.slot_title(s))
         else:
             color = QColor(FALLBACK_COLOR)
-            caption, title, rng = "ПУСТО", "Расписание не заполнено", ""
-            sub = "Нажмите карандаш в шапке, чтобы добавить слоты"
-            mini_title, mini_left, mini_tip = "Расписание пусто", "", sub
+            caption, title, rng = self.ui("EMPTY"), self.ui("No schedule yet"), ""
+            sub = self.ui("Click the pencil in the header to add slots")
+            mini_title, mini_left, mini_tip = self.ui("Schedule is empty"), "", sub
 
         for bar in (self.st_progress, self.mini_progress):
             if progress is None:
@@ -2516,12 +2744,12 @@ class ScheduleWidget(QWidget):
         return self._view_week * 7 + self._selected
 
     def week_name(self, i: int) -> str:
-        return self.cfg.week_names[i].strip() or DEFAULT_WEEK_NAMES[i]
+        return self.cfg.week_names[i] or self.ui(DEFAULT_WEEK_KEYS[i])
 
     def _page_caption(self) -> str:
-        cap = DAY_FULL[self._selected].upper()
+        cap = self.ui.weekday(self._selected).upper()
         if self.cfg.biweekly:
-            cap += f" · {self.week_name(self._view_week).upper()}"
+            cap += f" · {self.week_name(self._view_week)}"
         return cap
 
     def select_page(self, page: int) -> None:
@@ -2564,7 +2792,7 @@ class ScheduleWidget(QWidget):
         for i, b in enumerate(self.week_btns.buttons()):
             set_flag_prop(b, "today", i == cur_week)
 
-    def _sync_week_ui(self) -> None:
+    def _sync_week_ui(self, *, preserve_confirmation=False) -> None:
         """Названия недель и видимость переключателя — после смены режима или переименования."""
         on = self.cfg.biweekly
         self.week_bar.setVisible(on)
@@ -2574,11 +2802,13 @@ class ScheduleWidget(QWidget):
             fm = b.fontMetrics()
             text = fm.elidedText(name, Qt.ElideRight, 78)
             b.setText(text)
+            b.setAccessibleName(name)
             b.setFixedWidth(fm.horizontalAdvance(text) + 16)
-            b.setToolTip(f"{name} — идет сейчас" if i == cur else name)
+            b.setToolTip(self.ui("{name} — current week", name=name) if i == cur else name)
         if self._editing:
             self.editor.set_caption(self._page_caption())
-            self.editor.set_copy_target(self.week_name(1 - self._view_week) if on else None)
+            target = self.week_name(1 - self._view_week) if on else None
+            self.editor.set_copy_target(target, preserve_confirmation=preserve_confirmation)
         self._sync_settings()
 
     def _sync_settings(self) -> None:
@@ -2613,14 +2843,11 @@ class ScheduleWidget(QWidget):
         self.refresh()
 
     def _on_week_name_edited(self, i: int, text: str) -> None:
-        self.cfg.week_names[i] = text.strip()[:WEEK_NAME_MAX]
+        self.cfg.week_names[i] = text
         self._sync_week_ui()
         self._cfg_save_timer.start()
 
     def _on_week_name_finished(self, i: int) -> None:
-        if not self.cfg.week_names[i].strip():
-            self.cfg.week_names[i] = DEFAULT_WEEK_NAMES[i]  # пустое имя — вернуть стандартное
-            self._sync_week_ui()
         self._cfg_save_timer.stop()
         self._save_config()
 
@@ -2638,7 +2865,7 @@ class ScheduleWidget(QWidget):
         if not self.isVisible():
             self.toggle_visible()
         if self._editing:
-            self.close_editor()
+            self.editor.hide()
         self._settings_open = True
         set_flag_prop(self.btn_settings, "accent", True)
         self._sync_settings()
@@ -2655,7 +2882,9 @@ class ScheduleWidget(QWidget):
         self._settings_open = False
         self.settings.hide()
         set_flag_prop(self.btn_settings, "accent", False)
-        if not self._editing:
+        if self._editing:
+            self.editor.show()
+        else:
             self.status.show()
         self._fit_height()
         self.setFocus(Qt.OtherFocusReason)
@@ -2675,7 +2904,9 @@ class ScheduleWidget(QWidget):
     # ── редактирование расписания ──────────────────────────────────────────
 
     def toggle_editor(self) -> None:
-        if self._editing:
+        if self._editing and self._settings_open:
+            self.close_settings()
+        elif self._editing:
             self.close_editor()
         else:
             self.open_editor()
@@ -2683,7 +2914,8 @@ class ScheduleWidget(QWidget):
     def open_editor(self, ref: dict | None = None, *, focus_title: bool = False) -> None:
         if self._error:
             # иначе сохранение затрет битый файл последней рабочей версией
-            self.lbl_error.setText(f"{self._error} Исправьте файл — тогда редактор заработает.")
+            self._editor_blocked = True
+            self._show_file_errors()
             self.lbl_error.show()
             return
         if self.cfg.compact:
@@ -2697,7 +2929,8 @@ class ScheduleWidget(QWidget):
             self.status.hide()
             self.editor.show()
             self._set_glyph(self.btn_edit, G_EDIT, accent=True)
-            self.btn_edit.setToolTip("Закрыть редактор (Esc)")
+            self.ui.bind(self.btn_edit.setAccessibleName, "Close editor")
+            self.ui.bind(self.btn_edit.setToolTip, "Close editor (Esc)")
             self._rebuild_view()
         self._select_ref(ref if ref is not None else self._default_ref(self._page()))
         self.activateWindow()  # без активного окна поля не получат ввод с клавиатуры
@@ -2711,9 +2944,10 @@ class ScheduleWidget(QWidget):
         self._editing = False
         self._edit_ref = None
         self.editor.hide()
-        self.status.show()
+        self.status.setVisible(not self._settings_open)
         self._set_glyph(self.btn_edit, G_EDIT, accent=False)
-        self.btn_edit.setToolTip("Редактировать расписание (или двойной клик по слоту)")
+        self.ui.bind(self.btn_edit.setAccessibleName, "Edit schedule")
+        self.ui.bind(self.btn_edit.setToolTip, "Edit schedule (or double-click a slot)")
         self._rebuild_view()
         self.setFocus(Qt.OtherFocusReason)
 
@@ -2739,6 +2973,7 @@ class ScheduleWidget(QWidget):
         for c in self.cards:
             c.set_selected(ref is not None and c.slot.ref is ref)
         self.editor.load(ref, self._page_caption(), self.categories)
+        self._translate_category_choices()
         self.editor.set_copy_target(self.week_name(1 - self._view_week) if self.cfg.biweekly else None)
         self._scroll_timer.start()
 
@@ -2751,12 +2986,14 @@ class ScheduleWidget(QWidget):
             self.scroll.ensureWidgetVisible(card, 0, 24)
 
     def _on_card_clicked(self, card: SlotCard) -> None:
-        if self._editing:
+        if self._editing and not self._settings_open:
             self._select_ref(card.slot.ref)
 
     def _on_card_double_clicked(self, card: SlotCard) -> None:
         if self._editing:
             self._select_ref(card.slot.ref)
+            if self._settings_open:
+                self.close_settings()
             self.editor.focus_title()
         else:
             self.open_editor(card.slot.ref, focus_title=True)
@@ -2766,7 +3003,7 @@ class ScheduleWidget(QWidget):
         if item is None:
             return
         if name == "title":
-            item["title"] = str(value).strip()
+            item["title"] = str(value)
         elif name == "time":
             item["time"] = str(value)
         elif name == "category":
@@ -2798,7 +3035,7 @@ class ScheduleWidget(QWidget):
             now = current_time()
             t = (now.hour * 60 + now.minute + 14) // 15 * 15 if day == self._today_index(now) else 12 * 60
             category = next(iter(self.file_categories or self.categories), "Общее")
-        item = {"time": fmt_time(min(t, 1439)), "title": "Новый слот", "category": category}
+        item = {"time": fmt_time(min(t, 1439)), "title": self.ui("New slot"), "category": category}
         self.raw_days[day].append(item)
         self._edit_ref = item
         self._dirty = True
@@ -2836,8 +3073,7 @@ class ScheduleWidget(QWidget):
         err = self._write_schedule()
         if err is not None:
             self._dirty = True  # попробуем снова при следующей правке
-            self.editor.show_status("Не удалось сохранить", error=True)
-            self.editor.status.setToolTip(str(err))
+            self.editor.show_status("Could not save", error=True, detail=str(err))
         self.days = build_slots(self.raw_days)
         slots = self.days[self._page()]
         if (self._editing and len(slots) == len(self.cards)
@@ -2846,7 +3082,7 @@ class ScheduleWidget(QWidget):
             for card, slot in zip(self.cards, slots):
                 if card.slot != slot:
                     card.slot = slot
-                    card.lbl_title.setText(slot.title)
+                    card.lbl_title.setText(self.slot_title(slot))
                     card.lbl_start.setText(fmt_time(slot.start))
                     card.lbl_end.setText(fmt_time(slot.end))
             self._fit_height()
@@ -2854,7 +3090,7 @@ class ScheduleWidget(QWidget):
         else:
             self._rebuild_view()
         if err is None and self._editing:
-            self.editor.show_status("✓ Сохранено")
+            self.editor.show_status("✓ Saved")
         return err is None
 
     def copy_day_to_other_week(self, confirmed: bool = False) -> None:
@@ -2866,18 +3102,17 @@ class ScheduleWidget(QWidget):
         src, dst = self.raw_weeks[w][d], self.raw_weeks[1 - w][d]
         target = self.week_name(1 - w)
         if same_day_items(src, dst):
-            self.editor.show_status(f"Уже совпадает с «{target}»")
+            self.editor.show_status("Already matches “{target}”", target=partial(self.week_name, 1 - w))
             return
         if dst and not confirmed:
             n = len(dst)
-            self.editor.ask_copy_confirm(
-                f"Заменить {n} {plural(n, 'слот', 'слота', 'слотов')} в «{target}»?")
+            self.editor.ask_copy_confirm(n)
             return
         dst[:] = copy.deepcopy(src)  # тот же список — лента и раскладка недель видят изменение
         self._dirty = True
         if self._commit():
             self.editor.set_copy_target(target)  # сбросить подтверждение
-            self.editor.show_status(f"✓ Скопировано в «{target}»")
+            self.editor.show_status("✓ Copied to “{target}”", target=partial(self.week_name, 1 - w))
 
     def _rebuild_view(self) -> None:
         self._scroll_position = self.scroll.verticalScrollBar().value()
@@ -2897,8 +3132,8 @@ class ScheduleWidget(QWidget):
         self.setCursor(Qt.ArrowCursor if self.cfg.locked else Qt.SizeAllCursor)
         self._set_glyph(self.btn_lock, G_LOCKED if self.cfg.locked else G_UNLOCKED,
                         accent=not self.cfg.locked)
-        self.btn_lock.setToolTip("Позиция зафиксирована — нажмите, чтобы открепить" if self.cfg.locked
-                                 else "Режим перемещения — нажмите, чтобы зафиксировать")
+        self.ui.bind(self.btn_lock.setToolTip, "Position locked — click to unlock" if self.cfg.locked
+                                 else "Drag to move — click to lock position")
         self.update()
         if save:
             self._save_config()
@@ -2925,8 +3160,8 @@ class ScheduleWidget(QWidget):
         if self._desk and not on_top:
             self._desk.set_enabled(True)
         self._set_glyph(self.btn_level, G_ON_TOP if on_top else G_ON_DESKTOP, accent=on_top)
-        self.btn_level.setToolTip("Поверх всех окон — нажмите, чтобы убрать на рабочий стол" if on_top
-                                  else "На рабочем столе — нажмите, чтобы держать поверх всех окон")
+        self.ui.bind(self.btn_level.setToolTip, "Always on top — click to move to desktop" if on_top
+                                  else "On desktop — click to keep above all windows")
         if save:
             self._save_config()
 
@@ -2983,12 +3218,40 @@ class ScheduleWidget(QWidget):
             self.cfg.save(CONFIG_PATH)
             self._config_error = ""
         except OSError as exc:
-            self._config_error = f"Не удалось сохранить настройки: {exc}"
+            self._config_error = exc
         if hasattr(self, "lbl_error"):
             self._show_file_errors()
 
+    def _file_error_detail(self, error) -> str:
+        if isinstance(error, InterfaceError):
+            return self.ui(str(error))
+        if isinstance(error, json.JSONDecodeError):
+            return self.ui("Invalid JSON at line {line}, column {column}", line=error.lineno, column=error.colno)
+        if isinstance(error, UnicodeDecodeError):
+            return self.ui("Invalid UTF-8 at byte {offset}", offset=error.start)
+        if isinstance(error, UnicodeEncodeError):
+            return self.ui("Invalid Unicode character at position {offset}", offset=error.start)
+        if isinstance(error, RecursionError):
+            return self.ui("JSON nesting is too deep.")
+        if isinstance(error, FileNotFoundError):
+            return self.ui("File not found: {path}", path=error.filename or str(error))
+        if isinstance(error, PermissionError):
+            return self.ui("Access denied: {detail}", detail=str(error))
+        if isinstance(error, OSError) and error.errno == errno.ENOSPC:
+            return self.ui("Not enough disk space.")
+        return str(error)
+
     def _show_file_errors(self) -> None:
-        message = "\n".join(filter(None, (self._error, getattr(self, "_config_error", ""))))
+        messages = []
+        if self._error:
+            messages.append(self.ui("Could not load schedule: {error}", error=self._file_error_detail(self._error)))
+            if self._editor_blocked:
+                messages.append(self.ui("Fix the file to enable editing."))
+        if self._category_error:
+            messages.append(self.ui("Could not save category color to schedule.json"))
+        if getattr(self, "_config_error", None):
+            messages.append(self.ui("Could not save settings: {error}", error=self._config_error))
+        message = "\n".join(messages)
         self.lbl_error.setText(message)
         self.lbl_error.setVisible(bool(message))
 
@@ -3001,7 +3264,7 @@ class ScheduleWidget(QWidget):
             self.set_compact(False, save=False)
             self.show()
             self.open_editor()
-            self.editor.show_status("Не удалось сохранить. Повторите выход.", error=True)
+            self.editor.show_status("Could not save. Try quitting again.", error=True)
             return False
         self._save_pos_timer.stop()
         self.cfg.x, self.cfg.y = self.pos().x(), self.pos().y()
@@ -3146,6 +3409,12 @@ def main() -> int:
     repair_autostart()  # .exe перенесли в другую папку — обновить путь в реестре
 
     w = ScheduleWidget()
+    # An opt-in taskbar window makes the same UI accessible to window-based
+    # screen capture and assistive tools. The normal desktop launch is unchanged.
+    if "--window" in sys.argv:
+        if w._desk:
+            w._desk.set_enabled(False)
+        w.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
     w.show()
     return app.exec()
 
